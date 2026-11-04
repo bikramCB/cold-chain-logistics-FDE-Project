@@ -1,0 +1,33 @@
+# Phase 0 — Legacy MSSQL (admin / ingest)
+SQL_SERVER_HOST=
+SQL_SERVER_PORT=
+SQL_ADMIN_USER=
+SQL_ADMIN_PASSWORD=!
+
+# Phase 2+ — Agent read-only SQL user (created later by setup_security_and_view.sql)
+SQL_AGENT_USER=
+SQL_AGENT_PASSWORD=!
+
+# Phase 1 — Pinecone (add your key from https://app.pinecone.io/)
+PINECONE_API_KEY=
+
+# LLM / embeddings (defaults used by the agent later)
+# Agent_llm=OLLAMA
+Agent_llm=
+Embeddings_model=
+Local_Embedding_Model=
+
+# Target Project Parameters
+GOOGLE_CLOUD_PROJECT=
+GOOGLE_CLOUD_LOCATION=
+GEMINI_MODEL=
+DEEPSEEK_API_KEY=
+
+# Policy-answer cache only. Per session. Idle wipe, then a hard maximum age.
+# 7200s = 2 hours without a question. 28800s = 8 hours after the answer was saved.
+SOP_CACHE_IDLE_SECONDS=7200
+SOP_CACHE_MAX_AGE_SECONDS=28800
+
+# Local Cache Path Relocation to D: Drive
+HF_HOME=
+HF_HUB_DISABLE_SYMLINKS_WARNING=

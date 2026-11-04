@@ -23,7 +23,7 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            cd /home/ubuntu/cold-chain-logistics-FDE-Project
-            git pull origin main
+            cd /home/bikimj03/cold-chain-logistics-FDE-Project
+            git pull --ff-only origin main
             source venv/bin/activate
             sudo systemctl restart streamlit
