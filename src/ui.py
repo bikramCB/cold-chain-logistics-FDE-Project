@@ -1,6 +1,7 @@
 import ast
 import os
 import sys
+import time
 import uuid
 import json
 import html
@@ -465,10 +466,32 @@ def render_traces(traces):
                 st.markdown(f"**{done}** — what came back")
                 st.code(trace["content"], language="text")
 
+def _usage_counts(message):
+    usage = getattr(message, "usage_metadata", None) or {}
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if input_tokens is None and output_tokens is None:
+        return None
+    return {
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+    }
+
+
+def _tool_status(content: str) -> str:
+    lowered = (content or "").lower()
+    if lowered.startswith("error") or "retrieval error" in lowered:
+        return "error"
+    return "ok"
+
+
 def run_agent_turn(user_text: str, status) -> tuple[str, list]:
     """Stream one orchestrator turn. Returns the drafted answer and its traces."""
     final_response = ""
     current_traces = []
+    tool_started = None
     events = fde_agent.stream(
         {"messages": [HumanMessage(content=user_text)]},
         config=thread_config,
@@ -478,7 +501,16 @@ def run_agent_turn(user_text: str, status) -> tuple[str, list]:
         for node_name, node_state in event.items():
             if node_name == "reasoner":
                 latest_msg = node_state["messages"][-1]
+                usage = _usage_counts(latest_msg)
+                if usage:
+                    write_audit_log(
+                        session_id=st.session_state.thread_id,
+                        node_name="usage",
+                        tool_name="gemini",
+                        content=json.dumps(usage),
+                    )
                 if hasattr(latest_msg, "tool_calls") and latest_msg.tool_calls:
+                    tool_started = time.perf_counter()
                     for tool_call in latest_msg.tool_calls:
                         progress = TOOL_PROGRESS.get(tool_call["name"], "Checking one more source...")
                         status.update(label=progress)
@@ -495,7 +527,14 @@ def run_agent_turn(user_text: str, status) -> tuple[str, list]:
                             content=json.dumps(tool_call["args"]),
                         )
                 answer_text = as_text(latest_msg.content).strip()
-                if answer_text:
+                if answer_text and getattr(latest_msg, "tool_calls", None):
+                    write_audit_log(
+                        session_id=st.session_state.thread_id,
+                        node_name="reasoner_trace",
+                        tool_name="reasoner",
+                        content=answer_text,
+                    )
+                elif answer_text:
                     final_response = answer_text
                     status.update(label="Writing the answer in plain language...")
                     write_audit_log(
@@ -505,11 +544,16 @@ def run_agent_turn(user_text: str, status) -> tuple[str, list]:
                         content=final_response,
                     )
             elif node_name == "tools":
+                elapsed_ms = None
+                if tool_started is not None:
+                    elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
+                    tool_started = None
                 for msg in node_state.get("messages", []):
                     if isinstance(msg, ToolMessage):
                         progress = TOOL_PROGRESS.get(msg.name, "Checking one more source...")
                         status.update(label=progress)
                         status.write(TOOL_DONE.get(msg.name, msg.name) + " checked.")
+                        tool_text = as_text(msg.content)
                         current_traces.append({
                             "type": "tool_output",
                             "name": msg.name,
@@ -519,7 +563,16 @@ def run_agent_turn(user_text: str, status) -> tuple[str, list]:
                             session_id=st.session_state.thread_id,
                             node_name="tools",
                             tool_name=msg.name,
-                            content=as_text(msg.content),
+                            content=tool_text,
+                        )
+                        write_audit_log(
+                            session_id=st.session_state.thread_id,
+                            node_name="tool_meta",
+                            tool_name=msg.name,
+                            content=json.dumps({
+                                "duration_ms": elapsed_ms,
+                                "status": _tool_status(tool_text),
+                            }),
                         )
     return final_response, current_traces
 
@@ -647,6 +700,12 @@ if app_mode == "🧊 Dispatch Console":
                         node_name="sop_cache",
                         tool_name="sop_cache",
                         content=cached.answer,
+                    )
+                    write_audit_log(
+                        session_id=st.session_state.thread_id,
+                        node_name="cache_meta",
+                        tool_name="sop_cache",
+                        content=json.dumps({"age_seconds": int(cached.age_seconds)}),
                     )
                     render_assistant_answer(cached.answer, cache_traces)
                     st.caption(_cache_caption())

@@ -48,6 +48,7 @@ class _Entry:
 @dataclass
 class CacheHit:
     answer: str
+    age_seconds: int = 0
 
 
 class SopAnswerCache:
@@ -75,7 +76,7 @@ class SopAnswerCache:
             entry = self._entries.get(key)
             if entry is None:
                 return None
-            return CacheHit(answer=entry.answer)
+            return CacheHit(answer=entry.answer, age_seconds=int(now - entry.created_at))
 
     def put(self, session_id: str, question: str, answer: str) -> None:
         text = (answer or "").strip()
