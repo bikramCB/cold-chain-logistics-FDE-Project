@@ -15,7 +15,6 @@ load_dotenv(project_root / ".env")
 class NoAuditLogs(Exception):
     """Raised when the audit table has no final agent responses to grade."""
 
-
 def run_nightly_audit_evaluation():
     # 1. Connect to SQL Server using admin credentials to read AgentAuditLog
     db_host = os.getenv("SQL_SERVER_HOST", "localhost")

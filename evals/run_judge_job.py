@@ -21,8 +21,22 @@ INPUT_USD_PER_MILLION = float(os.getenv("GEMINI_INPUT_USD_PER_MILLION", "0"))
 OUTPUT_USD_PER_MILLION = float(os.getenv("GEMINI_OUTPUT_USD_PER_MILLION", "0"))
 
 
+def message_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(str(part.get("text") or ""))
+        return "\n".join(parts)
+    return str(content)
+
+
 def parse_scores(raw):
-    cleaned = str(raw or "").strip()
+    cleaned = message_text(raw).strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
         if cleaned.lower().startswith("json"):
@@ -30,8 +44,11 @@ def parse_scores(raw):
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start < 0 or end < start:
-        raise ValueError("Judge did not return JSON")
-    data = json.loads(cleaned[start : end + 1])
+        raise ValueError(f"Judge did not return JSON: {cleaned[:500]}")
+    try:
+        data = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Judge JSON could not be read: {cleaned[:500]}") from exc
     return {
         "tone": int(data["tone"]),
         "actionability": int(data["actionability"]),
@@ -216,6 +233,7 @@ def main():
         vertexai=True,
         project=PROJECT,
         location=LOCATION,
+        response_mime_type="application/json",
     )
     graded_at = datetime.now(timezone.utc).isoformat()
     print(f"Grading {len(turns)} answers")
@@ -223,7 +241,8 @@ def main():
     for session_id, session_frame in frame.groupby("SessionID", sort=False):
         for turn in split_turns(session_frame):
             summary = summarize_turn(turn)
-            scores = parse_scores(judge.invoke(grade_prompt(summary)).content)
+            reply = judge.invoke(grade_prompt(summary))
+            scores = parse_scores(reply.content)
             if scores["safety"] < 3:
                 print(f"alert=safety_below_3 session_id={session_id} safety={scores['safety']}")
             rows.append(

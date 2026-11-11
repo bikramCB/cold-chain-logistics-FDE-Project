@@ -207,3 +207,210 @@ sudo systemctl daemon-reload
 sudo systemctl enable streamlit
 sudo systemctl start streamlit
 ```
+
+# Phase 7
+
+## Nightly grading, where to look, and the safety email
+
+The Streamlit chat does not grade itself. Each chat turn writes rows into `FDE_VIEWS.AgentAuditLog` immediately. Once a night, Cloud Scheduler starts the Cloud Run job `eval-judge`. That job runs `evals/run_judge_job.py`, reads the last 24 hours of those rows, asks Gemini to score each final answer, and inserts one row per answer into BigQuery `eval.judge_scores`.
+
+If a safety score is below 3, the job prints `alert=safety_below_3`. A log-based metric counts that line, and the alerting policy **Safety score below 3** emails `bikimj03@gmail.com`.
+
+Project `project-a8f5b200-d874-4d72-b89`, region `asia-south1`. Run the `gcloud` commands from PowerShell on your PC. In PowerShell a command is one physical line. Quote any flag whose value contains a comma. The GitHub Action in `.github/workflows/deploy.yml` only pulls code onto the Streamlit VM and restarts Streamlit. It does not build or run this job.
+
+### What each chat turn already writes
+
+Same table and same columns as Phase 4 (`LogID`, `Timestamp`, `SessionID`, `NodeExecuted`, `ToolName`, `Content`). Extra detail is extra rows:
+
+| NodeExecuted | What Content holds |
+| --- | --- |
+| `reasoner_final` | The dispatcher-facing answer. The night job grades this. |
+| `tools` | Tool name plus the tool result, including SOP text. |
+| `tool_meta` | JSON `{duration_ms, status}` with status `ok` or `error`. |
+| `usage` | JSON input and output token counts. |
+| `reasoner_trace` | Model text from the step that chose a tool. |
+| `sop_cache` | The cached SOP answer. |
+| `cache_meta` | JSON `{age_seconds}` for that cache hit. |
+| `input_guard` / `output_guard` | A guardrail blocked the turn. |
+
+A turn ends at `reasoner_final`. Rows earlier in that `SessionID` belong to that answer.
+
+### 1. APIs and the two service accounts
+
+```
+gcloud services enable run.googleapis.com cloudscheduler.googleapis.com secretmanager.googleapis.com bigquery.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com aiplatform.googleapis.com logging.googleapis.com --project=project-a8f5b200-d874-4d72-b89
+```
+
+```
+gcloud iam service-accounts create eval-judge --project=project-a8f5b200-d874-4d72-b89
+gcloud iam service-accounts create eval-scheduler --project=project-a8f5b200-d874-4d72-b89
+```
+
+`eval-judge` runs the container. `eval-scheduler` is only allowed to start that job.
+
+```
+gcloud projects add-iam-policy-binding project-a8f5b200-d874-4d72-b89 --member=serviceAccount:eval-judge@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --role=roles/aiplatform.user
+gcloud projects add-iam-policy-binding project-a8f5b200-d874-4d72-b89 --member=serviceAccount:eval-judge@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --role=roles/logging.logWriter
+gcloud projects add-iam-policy-binding project-a8f5b200-d874-4d72-b89 --member=serviceAccount:eval-judge@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --role=roles/bigquery.jobUser
+gcloud projects add-iam-policy-binding project-a8f5b200-d874-4d72-b89 --member=serviceAccount:eval-judge@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --role=roles/bigquery.dataEditor
+```
+
+Cloud Build uses the default compute account. It needs the builder role or the image upload fails with 403:
+
+```
+gcloud projects add-iam-policy-binding project-a8f5b200-d874-4d72-b89 --member=serviceAccount:62474257474-compute@developer.gserviceaccount.com --role=roles/cloudbuild.builds.builder
+```
+
+### 2. A read-only SQL login, stored as secrets
+
+The job reaches SQL at the private address `10.128.0.2:1433` through the default VPC. Create login `USR_FDE_AUDIT` on the SQL VM (`instance-20261102-102739`, zone `us-central1-c`, container `legacy-mssql`) with `SELECT` on `FDE_VIEWS.AgentAuditLog` only. Put the username, password, and host in Secret Manager. Do not commit them.
+
+```
+gcloud secrets create sql-eval-user --replication-policy=automatic --project=project-a8f5b200-d874-4d72-b89
+gcloud secrets create sql-eval-password --replication-policy=automatic --project=project-a8f5b200-d874-4d72-b89
+gcloud secrets create sql-server-host --replication-policy=automatic --project=project-a8f5b200-d874-4d72-b89
+```
+
+Add a version to each secret (`USR_FDE_AUDIT`, the audit password, and `10.128.0.2`), then:
+
+```
+gcloud secrets add-iam-policy-binding sql-eval-user --member=serviceAccount:eval-judge@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --role=roles/secretmanager.secretAccessor --project=project-a8f5b200-d874-4d72-b89
+gcloud secrets add-iam-policy-binding sql-eval-password --member=serviceAccount:eval-judge@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --role=roles/secretmanager.secretAccessor --project=project-a8f5b200-d874-4d72-b89
+gcloud secrets add-iam-policy-binding sql-server-host --member=serviceAccount:eval-judge@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --role=roles/secretmanager.secretAccessor --project=project-a8f5b200-d874-4d72-b89
+```
+
+### 3. BigQuery table
+
+```
+bq mk --dataset --location=asia-south1 project-a8f5b200-d874-4d72-b89:eval
+```
+
+```sql
+CREATE TABLE IF NOT EXISTS `project-a8f5b200-d874-4d72-b89.eval.judge_scores` (
+  session_id STRING,
+  audited_at TIMESTAMP,
+  graded_at TIMESTAMP,
+  tone INT64,
+  actionability INT64,
+  safety INT64,
+  groundedness INT64,
+  comments STRING,
+  response_text STRING,
+  input_blocked BOOL,
+  output_blocked BOOL,
+  repeated_tool_failures INT64,
+  tool_error_count INT64,
+  tool_duration_ms INT64,
+  tool_trace STRING,
+  input_tokens INT64,
+  output_tokens INT64,
+  cost_usd FLOAT64,
+  cache_hit BOOL,
+  cache_age_seconds INT64,
+  cache_stale BOOL,
+  reasoning_trace STRING
+);
+```
+
+`bq query` prints `Skipped` for this DDL. That means the statement ran. Check the shape with `bq show --schema --format=prettyjson project-a8f5b200-d874-4d72-b89:eval.judge_scores`.
+
+Scores are 1 to 5:
+
+- **tone**: plain language for a night-shift dispatcher.
+- **actionability**: the next step gives clear SOP guidance.
+- **safety**: a cargo temperature above 4.0°C is identified when the tool results show one.
+- **groundedness**: a rule in the answer is supported by the retrieved SOP text.
+
+`cost_usd` is `(input_tokens / 1e6) * 1.65 + (output_tokens / 1e6) * 9.90`. Those are the non-global Gemini 3.5 Flash prices for `asia-south1`. Leaving the two variables unset stores `0`.
+
+### 4. Build the image and create the job
+
+From the project folder on your PC. `.gcloudignore` keeps `.env` out of the upload.
+
+```
+gcloud artifacts repositories create eval --repository-format=docker --location=asia-south1 --project=project-a8f5b200-d874-4d72-b89
+gcloud builds submit --tag asia-south1-docker.pkg.dev/project-a8f5b200-d874-4d72-b89/eval/judge:latest --project=project-a8f5b200-d874-4d72-b89
+```
+
+```
+gcloud run jobs create eval-judge --image=asia-south1-docker.pkg.dev/project-a8f5b200-d874-4d72-b89/eval/judge:latest --region=asia-south1 --service-account=eval-judge@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --network=default --subnet=default --vpc-egress=private-ranges-only --set-env-vars="GOOGLE_CLOUD_PROJECT=project-a8f5b200-d874-4d72-b89,GOOGLE_CLOUD_LOCATION=asia-south1,GEMINI_MODEL=gemini-3.5-flash,SQL_SERVER_PORT=1433,GEMINI_INPUT_USD_PER_MILLION=1.65,GEMINI_OUTPUT_USD_PER_MILLION=9.90" --set-secrets="SQL_EVAL_USER=sql-eval-user:latest,SQL_EVAL_PASSWORD=sql-eval-password:latest,SQL_SERVER_HOST=sql-server-host:latest" --project=project-a8f5b200-d874-4d72-b89
+```
+
+After a code change in `evals/run_judge_job.py`, submit the build again and then:
+
+```
+gcloud run jobs update eval-judge --region=asia-south1 --image=asia-south1-docker.pkg.dev/project-a8f5b200-d874-4d72-b89/eval/judge:latest --project=project-a8f5b200-d874-4d72-b89
+```
+
+### 5. Run it every night at 02:00 IST
+
+`eval-scheduler` needs permission to start the job. The Cloud Scheduler service agent needs permission to mint a token for `eval-scheduler`.
+
+```
+gcloud run jobs add-iam-policy-binding eval-judge --region=asia-south1 --member=serviceAccount:eval-scheduler@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --role=roles/run.invoker --project=project-a8f5b200-d874-4d72-b89
+gcloud iam service-accounts add-iam-policy-binding eval-scheduler@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --member=serviceAccount:service-62474257474@gcp-sa-cloudscheduler.iam.gserviceaccount.com --role=roles/iam.serviceAccountTokenCreator --project=project-a8f5b200-d874-4d72-b89
+```
+
+```
+gcloud scheduler jobs create http eval-judge-nightly --location=asia-south1 --schedule="0 2 * * *" --time-zone=Asia/Kolkata --uri="https://run.googleapis.com/v2/projects/project-a8f5b200-d874-4d72-b89/locations/asia-south1/jobs/eval-judge:run" --http-method=POST --oauth-service-account-email=eval-scheduler@project-a8f5b200-d874-4d72-b89.iam.gserviceaccount.com --project=project-a8f5b200-d874-4d72-b89
+```
+
+To grade today's chats without waiting until 02:00:
+
+```
+gcloud run jobs execute eval-judge --region=asia-south1 --wait --project=project-a8f5b200-d874-4d72-b89
+```
+
+A run with no `reasoner_final` row in the last 24 hours succeeds and prints `No reasoner_final rows in the last 24 hours.` BigQuery stays unchanged. Ask one real question in the Streamlit app first, then execute again.
+
+### 6. The email when safety is below 3
+
+This is done in the Google Cloud console.
+
+1. Open Logs Explorer. Set the time range to **Last 7 days**. Paste this and click **Run query**:
+
+```text
+resource.type="cloud_run_job"
+resource.labels.job_name="eval-judge"
+textPayload:"alert=safety_below_3"
+```
+
+An empty result is expected until some answer scores below 3. Create the metric from the filter anyway.
+
+2. **Actions** → **Create metric**. Name it `safety_below_3`. Type **Counter**.
+3. Monitoring → Alerting → **Create policy**.
+4. Select metric `Cloud Run Job - logging/user/safety_below_3`. If the list is empty, turn off **Active**. Add no filter. Rolling window `5 min`, rolling window function `sum`. Leave secondary transformation off.
+5. **Configure trigger**: Threshold, any time series violates, above threshold, value `0`, retest `0 sec`.
+6. Notification channel: email `bikimj03@gmail.com`. Policy name: `Safety score below 3`.
+
+The metric only counts log lines written after it was created. A score of 5 writes a BigQuery row and does not send mail. Mail goes out on the next job run whose safety score is 1 or 2.
+
+### When to look, and where
+
+| When | Where | What you should see |
+| --- | --- | --- |
+| Right after a chat | SQL `FDE_VIEWS.AgentAuditLog` for that `SessionID` | `reasoner_final`, and when the new `src/ui.py` is deployed, `usage`, `tool_meta`, `cache_meta` |
+| After 02:00 IST, or after `gcloud run jobs execute` | Cloud Run → Jobs → `eval-judge` → Executions | A succeeded execution |
+| Same moment | Logs Explorer, filter below | `Grading N answers` and `Wrote N rows to ...judge_scores` |
+| Same moment | BigQuery `eval.judge_scores` | One new row per final answer, with `cost_usd` filled in |
+| Only if safety is below 3 | Email, and the alerting policy page | Policy **Safety score below 3** opens an incident |
+
+Job logs, any time range that covers the run:
+
+```text
+resource.type="cloud_run_job"
+resource.labels.job_name="eval-judge"
+```
+
+Latest scores:
+
+```sql
+SELECT session_id, graded_at, tone, actionability, safety, groundedness,
+       input_tokens, output_tokens, cost_usd, tool_error_count,
+       cache_hit, cache_stale, comments
+FROM `project-a8f5b200-d874-4d72-b89.eval.judge_scores`
+ORDER BY graded_at DESC
+LIMIT 20;
+```
+
+A later run inserts another row. It does not update the row already stored, so an older row can keep `cost_usd = 0` from the run that happened before the price variables were set. The policy page shows an empty chart until the first `alert=safety_below_3` line. That empty chart means no answer has scored below 3 since the metric was created.
