@@ -224,9 +224,11 @@ Same table and same columns as Phase 4 (`LogID`, `Timestamp`, `SessionID`, `Node
 
 | NodeExecuted | What Content holds |
 | --- | --- |
+| `user_question` | The dispatcher’s question, stored before the answer. |
 | `reasoner_final` | The dispatcher-facing answer. The night job grades this. |
 | `tools` | Tool name plus the tool result, including SOP text. |
-| `tool_meta` | JSON `{duration_ms, status}` with status `ok` or `error`. |
+| `tool_meta` | JSON `{duration_ms, status}` with status `ok` or `error`. Tool time only. |
+| `response_meta` | JSON `{response_ms}`: milliseconds from the accepted question until the answer is ready to show. |
 | `usage` | JSON input and output token counts. |
 | `reasoner_trace` | Model text from the step that chose a tool. |
 | `sop_cache` | The cached SOP answer. |
@@ -295,12 +297,14 @@ CREATE TABLE IF NOT EXISTS `project-a8f5b200-d874-4d72-b89.eval.judge_scores` (
   safety INT64,
   groundedness INT64,
   comments STRING,
+  user_question STRING,
   response_text STRING,
   input_blocked BOOL,
   output_blocked BOOL,
   repeated_tool_failures INT64,
   tool_error_count INT64,
   tool_duration_ms INT64,
+  response_ms INT64,
   tool_trace STRING,
   input_tokens INT64,
   output_tokens INT64,
@@ -322,6 +326,8 @@ Scores are 1 to 5:
 - **groundedness**: a rule in the answer is supported by the retrieved SOP text.
 
 `cost_usd` is `(input_tokens / 1e6) * 1.65 + (output_tokens / 1e6) * 9.90`. Those are the non-global Gemini 3.5 Flash prices for `asia-south1`. Leaving the two variables unset stores `0`.
+
+`response_ms` is the customer wait on the server: from the moment the question is accepted until the answer text is ready to show, including a guardrail retry. `tool_duration_ms` is only the SQL, weather, and SOP calls inside that wait. A cached SOP reply stores `response_ms` in the audit log and does not create a new score row.
 
 ### 4. Build the image and create the job
 
@@ -405,8 +411,8 @@ resource.labels.job_name="eval-judge"
 Latest scores:
 
 ```sql
-SELECT session_id, graded_at, tone, actionability, safety, groundedness,
-       input_tokens, output_tokens, cost_usd, tool_error_count,
+SELECT session_id, user_question, graded_at, tone, actionability, safety, groundedness,
+       response_ms, input_tokens, output_tokens, cost_usd, tool_duration_ms, tool_error_count,
        cache_hit, cache_stale, comments
 FROM `project-a8f5b200-d874-4d72-b89.eval.judge_scores`
 ORDER BY graded_at DESC

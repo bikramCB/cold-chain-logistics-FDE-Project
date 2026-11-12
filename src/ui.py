@@ -480,6 +480,17 @@ def _usage_counts(message):
     }
 
 
+def write_response_ms(started: float) -> None:
+    """Milliseconds from the accepted question until the answer is ready to show."""
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    write_audit_log(
+        session_id=st.session_state.thread_id,
+        node_name="response_meta",
+        tool_name="turn",
+        content=json.dumps({"response_ms": elapsed_ms}),
+    )
+
+
 def _tool_status(content: str) -> str:
     lowered = (content or "").lower()
     if lowered.startswith("error") or "retrieval error" in lowered:
@@ -673,6 +684,12 @@ if app_mode == "🧊 Dispatch Console":
             render_user_question(user_input)
 
         with st.chat_message("assistant", avatar="🤖"):
+            write_audit_log(
+                session_id=st.session_state.thread_id,
+                node_name="user_question",
+                tool_name="dispatcher",
+                content=user_input,
+            )
             if not decision.allowed:
                 write_audit_log(
                     session_id=st.session_state.thread_id,
@@ -687,10 +704,14 @@ if app_mode == "🧊 Dispatch Console":
                     "traces": [],
                 })
             else:
+                started = time.perf_counter()
                 sop_cache.begin_turn(st.session_state.thread_id)
                 cached = sop_cache.get(st.session_state.thread_id, user_input)
+                final_response = ""
+                current_traces = []
+                issues = []
                 if cached:
-                    cache_traces = [{
+                    current_traces = [{
                         "type": "tool_output",
                         "name": "sop_cache",
                         "content": "Reused the policy answer saved for this session. Shipment and weather lookups were not reused.",
@@ -707,18 +728,8 @@ if app_mode == "🧊 Dispatch Console":
                         tool_name="sop_cache",
                         content=json.dumps({"age_seconds": int(cached.age_seconds)}),
                     )
-                    render_assistant_answer(cached.answer, cache_traces)
-                    st.caption(_cache_caption())
-                    render_traces(cache_traces)
-                    st.session_state.ui_messages.append({
-                        "role": "assistant",
-                        "content": cached.answer,
-                        "traces": cache_traces,
-                        "cached": True,
-                    })
+                    final_response = cached.answer
                 else:
-                    final_response = ""
-                    current_traces = []
                     with st.status("Reading your question...", expanded=True) as status:
                         final_response, current_traces = run_agent_turn(user_input, status)
                         issues = check_answer(final_response, current_traces)
@@ -729,6 +740,12 @@ if app_mode == "🧊 Dispatch Console":
                                 node_name="output_guard",
                                 tool_name="retry",
                                 content="\n".join(issues),
+                            )
+                            write_audit_log(
+                                session_id=st.session_state.thread_id,
+                                node_name="user_question",
+                                tool_name="dispatcher",
+                                content=user_input,
                             )
                             retried, retry_traces = run_agent_turn(correction_message(issues), status)
                             combined = current_traces + retry_traces
@@ -742,30 +759,41 @@ if app_mode == "🧊 Dispatch Console":
                     if final_response and is_sop_only(current_traces):
                         sop_cache.put(st.session_state.thread_id, user_input, final_response)
 
-                    if final_response:
-                        render_assistant_answer(final_response, current_traces)
-                        render_traces(current_traces)
-                        st.session_state.ui_messages.append({
-                            "role": "assistant",
-                            "content": final_response,
-                            "traces": current_traces,
-                        })
-                    elif issues:
-                        write_audit_log(
-                            session_id=st.session_state.thread_id,
-                            node_name="output_guard",
-                            tool_name="blocked",
-                            content=FALLBACK_ANSWER,
-                        )
-                        show_guardrail_message(FALLBACK_ANSWER)
-                        render_traces(current_traces)
-                        st.session_state.ui_messages.append({
-                            "role": "assistant",
-                            "content": FALLBACK_ANSWER,
-                            "traces": current_traces,
-                        })
-                    else:
-                        st.error("The assistant could not finish an answer. Check that the database is running, then ask again.")
+                write_response_ms(started)
+                if cached:
+                    render_assistant_answer(final_response, current_traces)
+                    st.caption(_cache_caption())
+                    render_traces(current_traces)
+                    st.session_state.ui_messages.append({
+                        "role": "assistant",
+                        "content": final_response,
+                        "traces": current_traces,
+                        "cached": True,
+                    })
+                elif final_response:
+                    render_assistant_answer(final_response, current_traces)
+                    render_traces(current_traces)
+                    st.session_state.ui_messages.append({
+                        "role": "assistant",
+                        "content": final_response,
+                        "traces": current_traces,
+                    })
+                elif issues:
+                    write_audit_log(
+                        session_id=st.session_state.thread_id,
+                        node_name="output_guard",
+                        tool_name="blocked",
+                        content=FALLBACK_ANSWER,
+                    )
+                    show_guardrail_message(FALLBACK_ANSWER)
+                    render_traces(current_traces)
+                    st.session_state.ui_messages.append({
+                        "role": "assistant",
+                        "content": FALLBACK_ANSWER,
+                        "traces": current_traces,
+                    })
+                else:
+                    st.error("The assistant could not finish an answer. Check that the database is running, then ask again.")
 
 
 elif app_mode == "🛡️ Security & Audit Logs":

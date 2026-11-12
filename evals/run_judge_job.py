@@ -106,7 +106,11 @@ def _tool_failed(content: str) -> bool:
 
 
 def split_turns(frame: pd.DataFrame) -> list[list[dict]]:
-    """A turn ends at each reasoner_final row. Earlier rows in that session belong to it."""
+    """A turn ends at each reasoner_final row. Earlier rows in that session belong to it.
+
+    response_meta is written after the answer exists, so a row that arrives
+    once the turn is already closed still belongs to that answer.
+    """
     turns = []
     current = []
     for _, row in frame.iterrows():
@@ -116,6 +120,9 @@ def split_turns(frame: pd.DataFrame) -> list[list[dict]]:
             "tool": _text(row["ToolName"]),
             "content": _text(row["Content"]),
         }
+        if item["node"] == "response_meta" and not current and turns:
+            turns[-1].append(item)
+            continue
         current.append(item)
         if item["node"] == "reasoner_final":
             turns.append(current)
@@ -167,6 +174,14 @@ def summarize_turn(turn: list[dict]) -> dict:
     reasoning = "\n".join(
         item["content"] for item in turn if item["node"] == "reasoner_trace" and item["content"]
     )
+    questions = [item["content"] for item in turn if item["node"] == "user_question" and item["content"]]
+    response_ms = None
+    for item in turn:
+        if item["node"] != "response_meta":
+            continue
+        meta = _json_dict(item["content"])
+        if meta.get("response_ms") is not None:
+            response_ms = int(meta["response_ms"])
     cache_age = max(cache_ages) if cache_ages else None
     cost = (
         (input_tokens / 1_000_000) * INPUT_USD_PER_MILLION
@@ -189,6 +204,8 @@ def summarize_turn(turn: list[dict]) -> dict:
         "cache_age_seconds": cache_age,
         "cache_stale": cache_age is not None and cache_age >= MAX_CACHE_AGE,
         "reasoning_trace": reasoning[:8000],
+        "user_question": (questions[-1] if questions else "")[:4000],
+        "response_ms": response_ms,
     }
 
 
@@ -207,6 +224,9 @@ SOP text the agent retrieved:
 
 Tool results:
 {summary["tool_trace"] or "(none)"}
+
+Dispatcher question:
+{summary["user_question"] or "(not recorded)"}
 
 Agent response:
 {summary["response"]}
@@ -255,7 +275,9 @@ def main():
                     "safety": scores["safety"],
                     "groundedness": scores["groundedness"],
                     "comments": scores["comments"],
+                    "user_question": summary["user_question"],
                     "response_text": summary["response"][:8000],
+                    "response_ms": summary["response_ms"],
                     "input_blocked": summary["input_blocked"],
                     "output_blocked": summary["output_blocked"],
                     "repeated_tool_failures": summary["repeated_tool_failures"],
