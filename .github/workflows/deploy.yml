@@ -1,29 +1,48 @@
-name: Enterprise Manual Deploy
+name: Deploy Streamlit to GCP
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Target Environment'
-        required: true
-        default: 'FDE-YT-Cold'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-streamlit-gcp
+  cancel-in-progress: false
 
 jobs:
   deploy:
+    name: Update fde-ai-cold-chain-logistics
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
+    timeout-minutes: 30
+    env:
+      GCE_PROJECT: project-a8f5b200-d874-4d72-b89
+      GCE_ZONE: asia-south1-c
+      GCE_INSTANCE: fde-ai-cold-chain-logistics
+      APP_USER: bikimj03
+      APP_DIR: /home/bikimj03/cold-chain-logistics-FDE-Project
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Deploy to EC2 via SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            cd /home/bikimj03/cold-chain-logistics-FDE-Project
-            git pull --ff-only origin main
-            source venv/bin/activate
-            sudo systemctl restart streamlit
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: project-a8f5b200-d874-4d72-b89
+
+      - name: Pull main and restart Streamlit
+        run: |
+          gcloud compute ssh "${APP_USER}@${GCE_INSTANCE}" \
+            --project="${GCE_PROJECT}" \
+            --zone="${GCE_ZONE}" \
+            --tunnel-through-iap \
+            --quiet \
+            --ssh-flag="-o StrictHostKeyChecking=accept-new" \
+            --command="set -euo pipefail; cd '${APP_DIR}'; test -f .env; test -x venv/bin/streamlit; git fetch origin main; git checkout main; BEFORE=\$(git rev-parse HEAD); git pull --ff-only origin main; if ! git diff --quiet \"\$BEFORE\" HEAD -- requirements.txt; then venv/bin/pip install -r requirements.txt; fi; sudo systemctl restart streamlit; sudo systemctl is-active streamlit; for i in 1 2 3 4 5 6 7 8 9 10; do curl -fsS http://127.0.0.1:8501/_stcore/health && exit 0; sleep 3; done; echo 'Streamlit did not become healthy on port 8501'; exit 1"
