@@ -3,7 +3,7 @@
 ## Ingesting data
 
 - Download the dataset from 'data\source\data.txt'
-- Create and EC2 instance > docker container > mcr.microsoft.com/mssql/server:2022-latest
+- Create a GCP Compute Engine VM, then run SQL Server in Docker: `mcr.microsoft.com/mssql/server:2022-latest`
 - Spin up the Legacy MSSQL Server
 ```
 docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" -p 1433:1433 --name legacy-mssql -d mcr.microsoft.com/mssql/server:2022-latest
@@ -18,7 +18,7 @@ docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" \
    -p 1433:1433 --name legacy-mssql \
    -d mcr.microsoft.com/mssql/server:2022-latest
 
-# or multi-line with volume inside EC2
+# or multi-line with a volume on the GCP SQL VM
 docker run -v mssql_data:/var/opt/mssql \
   -e "ACCEPT_EULA=Y" \
   -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" \
@@ -57,15 +57,23 @@ We need to query the database
 - SQL
 - SELECT COUNT(*) AS total_rows FROM dbo.TBL_SC_FLEET_HIST_RAW;
 
-## instruction for Ec2 instance > datbase
-- Instance type : c7i-flex.large
-- storage : 30 gb
-- ubuntu (linux)
-- Security group > attach the security while creating ec2 instance
-- Launch instance
-- SSH using .pem file from your system
-- install the docker
-- 
+## instruction for the GCP SQL VM
+The raw-data database is already on Compute Engine, not EC2.
+
+- VM name: `instance-20261102-102739`
+- Zone: `us-central1-c`
+- Private IP: `10.128.0.2`
+- Machine: Ubuntu, 30 GB disk
+- Container name: `legacy-mssql`
+
+SSH from your PC. There is no `.pem` file and no AWS security group.
+
+```
+gcloud compute ssh instance-20261102-102739 --zone=us-central1-c --project=project-a8f5b200-d874-4d72-b89
+```
+
+Install Docker on that VM, then start SQL Server with a volume:
+
 ```
 docker run -v mssql_data:/var/opt/mssql \
   -e "ACCEPT_EULA=Y" \
@@ -74,7 +82,8 @@ docker run -v mssql_data:/var/opt/mssql \
   --name legacy-mssql \
   -d mcr.microsoft.com/mssql/server:2022-latest
 ```
-- copy the ip address of the ec2 (public)
+
+Use `localhost` on port 1433 only when the SQL client is on this same VM. From the Streamlit VM, set `SQL_SERVER_HOST=10.128.0.2`. Both VMs are on the default VPC, and the default internal firewall already allows that path. Do not point the app at a public IP.
 
 # Phase 1
 
@@ -155,17 +164,23 @@ GRANT INSERT ON FDE_VIEWS.AgentAuditLog TO USR_FDE_RO;
 streamlit run src\ui.py
 
 ## Phase 6
-- Deployment
+The Streamlit app runs on the GCP VM `fde-ai-cold-chain-logistics` in `asia-south1-c`. The Linux user is `bikimj03`. The app directory is `/home/bikimj03/cold-chain-logistics-FDE-Project`. The public page is `http://8.234.82.34:8501`.
+
+A push to `main` runs `.github/workflows/deploy.yml`. That workflow SSHs to this VM through Identity-Aware Proxy, pulls `main`, and restarts the `streamlit` service. It does not deploy the SQL VM and it does not copy `.env`.
+
+One-time setup on a new VM, as `bikimj03`:
+
 ```
-sudo apt update && sudo apt install -y python3-pip python3-venv git
-cd /home/ubuntu
-git clone https://github.com/nimowhyca/cold-chain-logistics-FDE-Project.git
+sudo apt update && sudo apt install -y python3-pip python3-venv git curl
+cd /home/bikimj03
+git clone https://github.com/bikramCB/cold-chain-logistics-FDE-Project.git
 cd cold-chain-logistics-FDE-Project
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-streamlit run src/ui.py
 ```
+
+Create `.env` in that directory on the VM. Set `SQL_SERVER_HOST=10.128.0.2`. Do not commit `.env`, and do not set `HF_HOME` to a Windows path.
 
 1. Add the Microsoft GPG repository key
 curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
@@ -192,9 +207,9 @@ Description=Streamlit Cold-Chain Dispatch Console
 After=network.target
 
 [Service]
-User=ubuntu
-WorkingDirectory=/home/ubuntu/cold-chain-logistics-FDE-Project
-ExecStart=/home/ubuntu/cold-chain-logistics-FDE-Project/venv/bin/streamlit run src/ui.py --server.port=8501 --server.address=0.0.0.0
+User=bikimj03
+WorkingDirectory=/home/bikimj03/cold-chain-logistics-FDE-Project
+ExecStart=/home/bikimj03/cold-chain-logistics-FDE-Project/venv/bin/streamlit run src/ui.py --server.port=8501 --server.address=0.0.0.0
 Restart=always
 
 [Install]
@@ -216,7 +231,7 @@ The Streamlit chat does not grade itself. Each chat turn writes rows into `FDE_V
 
 If a safety score is below 3, the job prints `alert=safety_below_3`. A log-based metric counts that line, and the alerting policy **Safety score below 3** emails `bikimj03@gmail.com`.
 
-Project `project-a8f5b200-d874-4d72-b89`, region `asia-south1`. Run the `gcloud` commands from PowerShell on your PC. In PowerShell a command is one physical line. Quote any flag whose value contains a comma. The GitHub Action in `.github/workflows/deploy.yml` only pulls code onto the Streamlit VM and restarts Streamlit. It does not build or run this job.
+Project `project-a8f5b200-d874-4d72-b89`, region `asia-south1`. Run the `gcloud` commands from PowerShell on your PC. In PowerShell a command is one physical line. Quote any flag whose value contains a comma. The GitHub Action in `.github/workflows/deploy.yml` only pulls code onto the Streamlit VM `fde-ai-cold-chain-logistics` and restarts Streamlit. It does not build or run this job, and it does not change the SQL VM `instance-20261102-102739`.
 
 ### What each chat turn already writes
 
