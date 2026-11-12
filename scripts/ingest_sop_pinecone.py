@@ -30,15 +30,6 @@ if not PINECONE_API_KEY:
 # Set up clean production data cache path
 cache_dir = project_root / "data" / "cache"
 cache_dir.mkdir(parents=True, exist_ok=True)
-HASH_CACHE_FILE = cache_dir / "ingestion_hash_cache.json"
-
-hash_cache = {}
-if HASH_CACHE_FILE.exists():
-    try:
-        with open(HASH_CACHE_FILE, "r") as f:
-            hash_cache = json.load(f)
-    except Exception:
-        hash_cache = {}
 
 # ==========================================
 # 2. DYNAMIC ENVIRONMENT ROUTING
@@ -50,6 +41,25 @@ if EMBEDDINGS_MODEL_SETTING == "OPENAI":
     embeddings = OpenAIEmbeddings()
     INDEX_NAME = "fde-sop-index-openai"  # Isolated OpenAI Index
     TARGET_DIMENSION = 1536
+elif EMBEDDINGS_MODEL_SETTING == "VERTEX":
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+    project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    location = os.getenv("GOOGLE_CLOUD_LOCATION")
+    vertex_model = os.getenv("Vertex_Embedding_Model", "text-embedding-004").strip()
+    if not project or not location:
+        raise RuntimeError(
+            "GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION must be set in .env"
+        )
+    print(f"Mode: Vertex AI embeddings [{vertex_model}] in {location} (768 dim)...")
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model=vertex_model,
+        project=project,
+        location=location,
+        vertexai=True,
+    )
+    INDEX_NAME = "fde-sop-index-vertex"
+    TARGET_DIMENSION = 768
 else:
     # Read the explicit model identifier casing string from the .env parameters
     local_model_target = os.getenv("Local_Embedding_Model", "BAAI/bge-m3").strip()
@@ -90,6 +100,18 @@ if INDEX_NAME not in existing_indexes:
 
 index_client = pc.Index(INDEX_NAME)
 vector_store = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
+
+# The hash file remembers which documents were already embedded.
+# One file per index, so a new embedding model does not skip a file
+# that was only written to the previous index.
+HASH_CACHE_FILE = cache_dir / f"ingestion_hash_cache_{INDEX_NAME}.json"
+hash_cache = {}
+if HASH_CACHE_FILE.exists():
+    try:
+        with open(HASH_CACHE_FILE, "r") as f:
+            hash_cache = json.load(f)
+    except Exception:
+        hash_cache = {}
 
 # ==========================================
 # 4. ROBUST POLYMORPHIC PARSER

@@ -148,18 +148,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-EXAMPLE_QUESTIONS = [
-    (
-        "Check Los Angeles shipments",
-        "Find any active shipments near Los Angeles (Latitude ~33.8, Longitude ~-118.1). "
-        "Check the local weather there, and tell me if the current cargo temperature violates the SOP for fresh perishables.",
-    ),
-    (
-        "Explain Tier 1 and Tier 2",
-        "I'm a new dispatcher on the night shift. Can you quickly explain the difference between a Tier 1 and Tier 2 escalation?",
-    ),
-]
-
 TOOL_PROGRESS = {
     "query_telemetry_db": "Looking up shipments in that area...",
     "fetch_corridor_conditions": "Checking the weather and traffic on that route...",
@@ -650,16 +638,10 @@ if app_mode == "🧊 Dispatch Console":
     if not st.session_state.ui_messages:
         st.markdown(
             '<div class="welcome-card"><h3>Start with a question</h3>'
-            "<p>Type it in the box at the bottom, or use one of the buttons. "
+            "<p>Type it in the box at the bottom. "
             "Your question will show up as a card, and the answer will be written for a dispatcher, not an engineer.</p></div>",
             unsafe_allow_html=True,
         )
-        starter_cols = st.columns(2)
-        for column, (label, question) in zip(starter_cols, EXAMPLE_QUESTIONS):
-            with column:
-                if st.button(label, use_container_width=True):
-                    st.session_state.pending_question = question
-                    st.rerun()
 
     for entry in st.session_state.ui_messages:
         with st.chat_message(entry["role"], avatar="👤" if entry["role"] == "user" else "🤖"):

@@ -52,6 +52,24 @@ if EMBEDDINGS_MODEL_SETTING == "OPENAI":
     print("🤖 Mode: Connecting to Cloud OpenAI Index (1536 Dim Space)...")
     embeddings = OpenAIEmbeddings()
     INDEX_NAME = "fde-sop-index-openai"
+elif EMBEDDINGS_MODEL_SETTING == "VERTEX":
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+    project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    location = os.getenv("GOOGLE_CLOUD_LOCATION")
+    vertex_model = os.getenv("Vertex_Embedding_Model", "text-embedding-004").strip()
+    if not project or not location:
+        raise RuntimeError(
+            "GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION must be set in .env"
+        )
+    print(f"Mode: Vertex AI embeddings [{vertex_model}] in {location} (768 dim)...")
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model=vertex_model,
+        project=project,
+        location=location,
+        vertexai=True,
+    )
+    INDEX_NAME = "fde-sop-index-vertex"
 else :
     local_model_target = os.getenv("Local_Embedding_Model", "BAAI/bge-m3").strip()
     
