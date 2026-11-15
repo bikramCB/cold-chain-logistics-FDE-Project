@@ -30,7 +30,12 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
 
-from src.agent_tools import query_telemetry_db, fetch_corridor_conditions, search_compliance_sop
+from src.agent_tools import (
+    fetch_corridor_conditions,
+    query_telemetry_db,
+    search_compliance_sop,
+    tool_turn,
+)
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -114,6 +119,7 @@ graph_builder.add_conditional_edges("reasoner", tools_condition)
 graph_builder.add_edge("tools", "reasoner")
 
 fde_agent = graph_builder.compile(checkpointer=MemorySaver())
+RECURSION_LIMIT = 8
 
 # ==========================================
 # 4. CHAT LOOP TESTING PANEL
@@ -135,7 +141,7 @@ if __name__ == "__main__":
 
     system_prompt = SystemMessage(content=system_instructions)
     
-    thread_config = {"configurable": {"thread_id": "production_test_1"}}
+    thread_config = {"configurable": {"thread_id": "production_test_1"}, "recursion_limit": RECURSION_LIMIT}
 
     initial_messages = [
         system_prompt, 
@@ -163,12 +169,26 @@ if __name__ == "__main__":
             print(f"\n🤖 FDE Agent:\n{decision.message}")
             continue
 
-        events = fde_agent.stream({"messages": [("user", user_input)]}, config=thread_config, stream_mode="updates")
-        for event in events:
-            for node_name, node_state in event.items():
-                if node_name == "tools":
-                    print("   [System] 🔄 Retrieving external data elements via ToolNode...")
-                elif node_name == "reasoner":
-                    latest_msg = node_state["messages"][-1]
-                    if latest_msg.content:
-                        print(f"\n🤖 FDE Agent:\n{latest_msg.content}")
+        events = fde_agent.stream(
+            {"messages": [("user", user_input)]},
+            config=thread_config,
+            stream_mode="updates",
+        )
+        try:
+            with tool_turn():
+                for event in events:
+                    for node_name, node_state in event.items():
+                        if node_name == "tools":
+                            print("   [System] 🔄 Retrieving external data elements via ToolNode...")
+                        elif node_name == "reasoner":
+                            latest_msg = node_state["messages"][-1]
+                            if latest_msg.content:
+                                print(f"\n🤖 FDE Agent:\n{latest_msg.content}")
+        except Exception as error:
+            if error.__class__.__name__ != "GraphRecursionError":
+                raise
+            print(
+                "\n🤖 FDE Agent:\n"
+                "I stopped this lookup because it kept calling the same checks. "
+                "Ask again about one shipment or one location."
+            )

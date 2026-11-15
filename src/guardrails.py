@@ -155,6 +155,15 @@ def check_answer(answer: str, traces: list[dict]) -> list[str]:
                     f"The answer places the shipment in {city}, which does not match the coordinates on the records."
                 )
 
+    telemetry = _outputs(traces, "query_telemetry_db")
+    if telemetry and all(_failed_tool_text(item) for item in telemetry):
+        if _cargo_temperature_claim(text) is not None or _cargo_safety_label(text):
+            issues.append(
+                "Shipment records were not retrieved, so do not state a cargo temperature or call the cargo safe. "
+                "Tell the dispatcher to contact the driver if a breach is possible, and to escalate a High Risk "
+                "shipment with delay probability above 0.65 to the Tier 2 Logistics Manager."
+            )
+
     return issues
 
 
@@ -173,6 +182,22 @@ FALLBACK_ANSWER = (
     "I could not confirm that answer against the shipment records and the rule book, "
     "so I am not showing it. Ask the question again."
 )
+
+ESCALATION_ANSWER = (
+    "I could not read the shipment records, so I am not stating a cargo temperature. "
+    "Do not treat the cargo as safe. Contact the driver if a breach is possible. "
+    "Escalate a High Risk shipment with delay probability above 0.65 to the Tier 2 Logistics Manager."
+)
+
+
+def _failed_tool_text(content: str) -> bool:
+    lowered = (content or "").lower()
+    return (
+        lowered.startswith("error")
+        or "database error" in lowered
+        or "security block" in lowered
+        or "unavailable" in lowered
+    )
 
 
 def _cargo_temperatures(traces: list[dict]) -> list[float]:

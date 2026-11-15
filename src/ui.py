@@ -26,8 +26,16 @@ if str(project_root) not in sys.path:
 load_dotenv(project_root / ".env")
 
 # Import the compiled graph and tools list dynamically
-from src.orchestrator import fde_agent
-from src.guardrails import FALLBACK_ANSWER, check_answer, correction_message, screen_input
+from src.orchestrator import RECURSION_LIMIT, fde_agent
+from src.agent_tools import is_tool_failure, tool_turn
+from src.guardrails import (
+    ESCALATION_ANSWER,
+    FALLBACK_ANSWER,
+    check_answer,
+    correction_message,
+    screen_input,
+)
+from langgraph.errors import GraphRecursionError
 from src.sop_cache import is_sop_only, sop_cache
 
 # ==========================================
@@ -480,100 +488,121 @@ def write_response_ms(started: float) -> None:
 
 
 def _tool_status(content: str) -> str:
-    lowered = (content or "").lower()
-    if lowered.startswith("error") or "retrieval error" in lowered:
+    if is_tool_failure(content):
         return "error"
     return "ok"
 
 
-def run_agent_turn(user_text: str, status) -> tuple[str, list]:
-    """Stream one orchestrator turn. Returns the drafted answer and its traces."""
+def _telemetry_unreadable(traces: list) -> bool:
+    outputs = [
+        trace.get("content")
+        for trace in traces
+        if trace.get("type") == "tool_output" and trace.get("name") == "query_telemetry_db"
+    ]
+    return bool(outputs) and all(is_tool_failure(as_text(item)) for item in outputs)
+
+
+def run_agent_turn(user_text: str, status) -> tuple[str, list, str | None]:
+    """Stream one orchestrator turn. The third value is a message when the loop is stopped."""
     final_response = ""
     current_traces = []
     tool_started = None
-    events = fde_agent.stream(
-        {"messages": [HumanMessage(content=user_text)]},
-        config=thread_config,
-        stream_mode="updates",
-    )
-    for event in events:
-        for node_name, node_state in event.items():
-            if node_name == "reasoner":
-                latest_msg = node_state["messages"][-1]
-                usage = _usage_counts(latest_msg)
-                if usage:
-                    write_audit_log(
-                        session_id=st.session_state.thread_id,
-                        node_name="usage",
-                        tool_name="gemini",
-                        content=json.dumps(usage),
-                    )
-                if hasattr(latest_msg, "tool_calls") and latest_msg.tool_calls:
-                    tool_started = time.perf_counter()
-                    for tool_call in latest_msg.tool_calls:
-                        progress = TOOL_PROGRESS.get(tool_call["name"], "Checking one more source...")
-                        status.update(label=progress)
-                        status.write(progress)
-                        current_traces.append({
-                            "type": "tool_input",
-                            "name": tool_call["name"],
-                            "args": tool_call["args"],
-                        })
-                        write_audit_log(
-                            session_id=st.session_state.thread_id,
-                            node_name="reasoner",
-                            tool_name=tool_call["name"],
-                            content=json.dumps(tool_call["args"]),
-                        )
-                answer_text = as_text(latest_msg.content).strip()
-                if answer_text and getattr(latest_msg, "tool_calls", None):
-                    write_audit_log(
-                        session_id=st.session_state.thread_id,
-                        node_name="reasoner_trace",
-                        tool_name="reasoner",
-                        content=answer_text,
-                    )
-                elif answer_text:
-                    final_response = answer_text
-                    status.update(label="Writing the answer in plain language...")
-                    write_audit_log(
-                        session_id=st.session_state.thread_id,
-                        node_name="reasoner_final",
-                        tool_name="LLM Text Synthesis",
-                        content=final_response,
-                    )
-            elif node_name == "tools":
-                elapsed_ms = None
-                if tool_started is not None:
-                    elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
-                    tool_started = None
-                for msg in node_state.get("messages", []):
-                    if isinstance(msg, ToolMessage):
-                        progress = TOOL_PROGRESS.get(msg.name, "Checking one more source...")
-                        status.update(label=progress)
-                        status.write(TOOL_DONE.get(msg.name, msg.name) + " checked.")
-                        tool_text = as_text(msg.content)
-                        current_traces.append({
-                            "type": "tool_output",
-                            "name": msg.name,
-                            "content": msg.content,
-                        })
-                        write_audit_log(
-                            session_id=st.session_state.thread_id,
-                            node_name="tools",
-                            tool_name=msg.name,
-                            content=tool_text,
-                        )
-                        write_audit_log(
-                            session_id=st.session_state.thread_id,
-                            node_name="tool_meta",
-                            tool_name=msg.name,
-                            content=json.dumps({
-                                "duration_ms": elapsed_ms,
-                                "status": _tool_status(tool_text),
-                            }),
-                        )
-    return final_response, current_traces
+    config = {
+        "configurable": {"thread_id": st.session_state.thread_id},
+        "recursion_limit": RECURSION_LIMIT,
+    }
+    try:
+        with tool_turn():
+            events = fde_agent.stream(
+                {"messages": [HumanMessage(content=user_text)]},
+                config=config,
+                stream_mode="updates",
+            )
+            for event in events:
+                for node_name, node_state in event.items():
+                    if node_name == "reasoner":
+                        latest_msg = node_state["messages"][-1]
+                        usage = _usage_counts(latest_msg)
+                        if usage:
+                            write_audit_log(
+                                session_id=st.session_state.thread_id,
+                                node_name="usage",
+                                tool_name="gemini",
+                                content=json.dumps(usage),
+                            )
+                        if hasattr(latest_msg, "tool_calls") and latest_msg.tool_calls:
+                            tool_started = time.perf_counter()
+                            for tool_call in latest_msg.tool_calls:
+                                progress = TOOL_PROGRESS.get(tool_call["name"], "Checking one more source...")
+                                status.update(label=progress)
+                                status.write(progress)
+                                current_traces.append({
+                                    "type": "tool_input",
+                                    "name": tool_call["name"],
+                                    "args": tool_call["args"],
+                                })
+                                write_audit_log(
+                                    session_id=st.session_state.thread_id,
+                                    node_name="reasoner",
+                                    tool_name=tool_call["name"],
+                                    content=json.dumps(tool_call["args"]),
+                                )
+                        answer_text = as_text(latest_msg.content).strip()
+                        if answer_text and getattr(latest_msg, "tool_calls", None):
+                            write_audit_log(
+                                session_id=st.session_state.thread_id,
+                                node_name="reasoner_trace",
+                                tool_name="reasoner",
+                                content=answer_text,
+                            )
+                        elif answer_text:
+                            final_response = answer_text
+                            status.update(label="Writing the answer in plain language...")
+                            write_audit_log(
+                                session_id=st.session_state.thread_id,
+                                node_name="reasoner_final",
+                                tool_name="LLM Text Synthesis",
+                                content=final_response,
+                            )
+                    elif node_name == "tools":
+                        elapsed_ms = None
+                        if tool_started is not None:
+                            elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
+                            tool_started = None
+                        for msg in node_state.get("messages", []):
+                            if isinstance(msg, ToolMessage):
+                                progress = TOOL_PROGRESS.get(msg.name, "Checking one more source...")
+                                status.update(label=progress)
+                                status.write(TOOL_DONE.get(msg.name, msg.name) + " checked.")
+                                tool_text = as_text(msg.content)
+                                current_traces.append({
+                                    "type": "tool_output",
+                                    "name": msg.name,
+                                    "content": msg.content,
+                                })
+                                write_audit_log(
+                                    session_id=st.session_state.thread_id,
+                                    node_name="tools",
+                                    tool_name=msg.name,
+                                    content=tool_text,
+                                )
+                                write_audit_log(
+                                    session_id=st.session_state.thread_id,
+                                    node_name="tool_meta",
+                                    tool_name=msg.name,
+                                    content=json.dumps({
+                                        "duration_ms": elapsed_ms,
+                                        "status": _tool_status(tool_text),
+                                    }),
+                                )
+    except GraphRecursionError:
+        return (
+            "",
+            current_traces,
+            "I stopped this lookup because it kept calling the same checks. "
+            "Ask again about one shipment or one location.",
+        )
+    return final_response, current_traces, None
 
 
 def _cache_caption() -> str:
@@ -692,6 +721,7 @@ if app_mode == "🧊 Dispatch Console":
                 final_response = ""
                 current_traces = []
                 issues = []
+                stop_message = None
                 if cached:
                     current_traces = [{
                         "type": "tool_output",
@@ -713,36 +743,51 @@ if app_mode == "🧊 Dispatch Console":
                     final_response = cached.answer
                 else:
                     with st.status("Reading your question...", expanded=True) as status:
-                        final_response, current_traces = run_agent_turn(user_input, status)
-                        issues = check_answer(final_response, current_traces)
-                        if issues:
-                            status.update(label="The draft disagreed with the records. Checking once more...")
-                            write_audit_log(
-                                session_id=st.session_state.thread_id,
-                                node_name="output_guard",
-                                tool_name="retry",
-                                content="\n".join(issues),
-                            )
-                            write_audit_log(
-                                session_id=st.session_state.thread_id,
-                                node_name="user_question",
-                                tool_name="dispatcher",
-                                content=user_input,
-                            )
-                            retried, retry_traces = run_agent_turn(correction_message(issues), status)
-                            combined = current_traces + retry_traces
-                            if retried and not check_answer(retried, combined):
-                                final_response = retried
-                                current_traces = combined
-                            else:
-                                final_response = ""
+                        final_response, current_traces, stop_message = run_agent_turn(user_input, status)
+                        if not stop_message:
+                            issues = check_answer(final_response, current_traces)
+                            if issues:
+                                status.update(label="The draft disagreed with the records. Checking once more...")
+                                write_audit_log(
+                                    session_id=st.session_state.thread_id,
+                                    node_name="output_guard",
+                                    tool_name="retry",
+                                    content="\n".join(issues),
+                                )
+                                write_audit_log(
+                                    session_id=st.session_state.thread_id,
+                                    node_name="user_question",
+                                    tool_name="dispatcher",
+                                    content=user_input,
+                                )
+                                retried, retry_traces, retry_stop = run_agent_turn(
+                                    correction_message(issues), status
+                                )
+                                combined = current_traces + retry_traces
+                                if retry_stop:
+                                    stop_message = retry_stop
+                                    current_traces = combined
+                                    final_response = ""
+                                elif retried and not check_answer(retried, combined):
+                                    final_response = retried
+                                    current_traces = combined
+                                else:
+                                    final_response = ""
                         status.update(label="Answer ready", state="complete", expanded=False)
 
-                    if final_response and is_sop_only(current_traces):
+                    if final_response and not stop_message and is_sop_only(current_traces):
                         sop_cache.put(st.session_state.thread_id, user_input, final_response)
 
                 write_response_ms(started)
-                if cached:
+                if stop_message:
+                    show_guardrail_message(stop_message)
+                    render_traces(current_traces)
+                    st.session_state.ui_messages.append({
+                        "role": "assistant",
+                        "content": stop_message,
+                        "traces": current_traces,
+                    })
+                elif cached:
                     render_assistant_answer(final_response, current_traces)
                     st.caption(_cache_caption())
                     render_traces(current_traces)
@@ -761,17 +806,18 @@ if app_mode == "🧊 Dispatch Console":
                         "traces": current_traces,
                     })
                 elif issues:
+                    withheld = ESCALATION_ANSWER if _telemetry_unreadable(current_traces) else FALLBACK_ANSWER
                     write_audit_log(
                         session_id=st.session_state.thread_id,
                         node_name="output_guard",
                         tool_name="blocked",
-                        content=FALLBACK_ANSWER,
+                        content=withheld,
                     )
-                    show_guardrail_message(FALLBACK_ANSWER)
+                    show_guardrail_message(withheld)
                     render_traces(current_traces)
                     st.session_state.ui_messages.append({
                         "role": "assistant",
-                        "content": FALLBACK_ANSWER,
+                        "content": withheld,
                         "traces": current_traces,
                     })
                 else:

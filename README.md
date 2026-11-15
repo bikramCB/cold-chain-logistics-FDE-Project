@@ -43,6 +43,16 @@ The provider only accepts tokens whose repository is `bikramCB/cold-chain-logist
 - Passwordless `sudo` for `systemctl`, so the job can restart the service.
 - The `streamlit` network tag and firewall rule `allow-ssh-iap-streamlit`, which allows TCP 22 only from Google's Identity-Aware Proxy range `35.235.240.0/20`.
 
+## When a tool fails
+
+The console limits a bad SQL, weather, or rule-book call instead of waiting on it. The full list is in [docs/instrutions.md](docs/instrutions.md) under Phase 3.
+
+- Each tool runs at most twice per question.
+- SQL and the rule book time out at 8 seconds. Weather times out at 6 seconds and is tried once more.
+- After three connection failures in a minute, that service is skipped for 30 seconds.
+- The agent stops after 8 steps instead of calling tools forever.
+- If shipment records cannot be read, the screen does not guess a cargo temperature. It tells the dispatcher to contact the driver and to escalate a High Risk shipment with delay probability above 0.65.
+
 ## What this pipeline does not deploy
 
 - The SQL Server VM `instance-20261102-102739` in `us-central1-c`.

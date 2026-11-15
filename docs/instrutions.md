@@ -140,6 +140,22 @@ Find any active shipments near Los Angeles (Latitude ~33.8, Longitude ~-118.1). 
 I'm a new dispatcher on the night shift. Can you quickly explain the difference between a Tier 1 and Tier 2 escalation?
 ```
 
+### When a tool fails
+
+`src/agent_tools.py` limits each lookup. A failed call returns an `error:` string, the chat continues with the tools that worked, and the failure is written to `FDE_VIEWS.AgentAuditLog` with `tool_meta.status` set to `error`.
+
+| Lookup | Timeout | Retry | Stop calling it |
+| --- | --- | --- | --- |
+| `query_telemetry_db` | 8 seconds to connect and 8 seconds to run the query | None. A bad `SELECT` is not tried again. | Twice per question. After 3 connection failures in 60 seconds, skip it for 30 seconds. |
+| `fetch_corridor_conditions` | 6 seconds | Once, after 0.4 seconds, only for a timeout, a dropped connection, or HTTP 500. | Twice per question. Same 3-failure skip. |
+| `search_compliance_sop` | 8 seconds | None | Twice per question. Same 3-failure skip. |
+
+Other limits:
+
+- SQL must be one `SELECT`. A second statement, or `INSERT`, `UPDATE`, `DELETE`, `DROP`, or `INTO`, is refused. Latitude must be between -90 and 90, and longitude between -180 and 180. An empty or 500-character rule-book question is refused.
+- The graph in `src/orchestrator.py` stops after 8 steps (`RECURSION_LIMIT`). The screen says the lookup was stopped and asks for one shipment or one location.
+- If shipment records were not read and the draft still states a cargo temperature, the draft is not shown. The screen tells the dispatcher not to treat the cargo as safe, to contact the driver if a breach is possible, and to escalate a High Risk shipment with delay probability above 0.65 to the Tier 2 Logistics Manager.
+- Chat memory is `MemorySaver` in the Streamlit process. It keeps the conversation for that process. It does not resume a call that died halfway through.
 
 ## Phase 4
 Go to VS-code > CTRL + N > 'click on plain-text' and use 'sql'

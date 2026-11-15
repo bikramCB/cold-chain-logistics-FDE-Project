@@ -1,6 +1,13 @@
 import os
+import re
+import time
 import urllib
 import requests
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -91,6 +98,128 @@ else :
 vector_store = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
 retriever = vector_store.as_retriever(search_kwargs={"k": 2})
 
+# One dispatcher turn may call each tool twice. The third call is refused.
+MAX_CALLS_PER_TURN = 2
+SQL_TIMEOUT_SECONDS = 8
+WEATHER_TIMEOUT_SECONDS = 6
+SOP_TIMEOUT_SECONDS = 8
+_WEATHER_RETRY_SECONDS = 0.4
+_BREAKER_FAILURES = 3
+_BREAKER_WINDOW_SECONDS = 60
+_BREAKER_OPEN_SECONDS = 30
+
+_turn_counts: ContextVar[dict | None] = ContextVar("fde_tool_turn", default=None)
+_sop_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sop-search")
+_SQL_FORBIDDEN = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|EXEC|EXECUTE|MERGE|GRANT|REVOKE|CREATE|INTO)\b",
+    re.IGNORECASE,
+)
+
+
+class ServiceBreaker:
+    """Opens after repeated connection failures so the next chat does not wait on a dead service."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self._failures: deque[float] = deque()
+        self._open_until = 0.0
+
+    def allow(self) -> str | None:
+        if time.monotonic() < self._open_until:
+            return (
+                f"error: {self.name} is unavailable after repeated failures. "
+                "Continue without it. Do not invent its numbers."
+            )
+        return None
+
+    def record_success(self) -> None:
+        self._failures.clear()
+        self._open_until = 0.0
+
+    def record_failure(self) -> None:
+        now = time.monotonic()
+        self._failures.append(now)
+        while self._failures and now - self._failures[0] > _BREAKER_WINDOW_SECONDS:
+            self._failures.popleft()
+        if len(self._failures) >= _BREAKER_FAILURES:
+            self._open_until = now + _BREAKER_OPEN_SECONDS
+
+    def reset(self) -> None:
+        self._failures.clear()
+        self._open_until = 0.0
+
+
+sql_breaker = ServiceBreaker("the shipment database")
+weather_breaker = ServiceBreaker("the weather service")
+sop_breaker = ServiceBreaker("the rule book")
+
+
+def is_tool_failure(content: str) -> bool:
+    lowered = (content or "").lower()
+    return (
+        lowered.startswith("error")
+        or "database error" in lowered
+        or "communication failure" in lowered
+        or "retrieval error" in lowered
+        or "security block" in lowered
+        or "unavailable" in lowered
+    )
+
+
+def _is_outage(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        token in lowered
+        for token in (
+            "timeout",
+            "timed out",
+            "communication link",
+            "connection",
+            "network",
+            "unavailable",
+            "temporarily",
+            "08001",
+            "hyt00",
+            "hyt01",
+            "08s01",
+        )
+    )
+
+
+@contextmanager
+def tool_turn():
+    """Count tool calls for the chat turn running on this thread."""
+    token = _turn_counts.set({})
+    try:
+        yield
+    finally:
+        _turn_counts.reset(token)
+
+
+def _over_turn_cap(tool_name: str) -> str | None:
+    counts = _turn_counts.get()
+    if counts is None:
+        return None
+    count = counts.get(tool_name, 0) + 1
+    counts[tool_name] = count
+    if count > MAX_CALLS_PER_TURN:
+        return (
+            f"error: {tool_name} already ran {MAX_CALLS_PER_TURN} times this turn. "
+            "Stop calling it and answer from the results you have."
+        )
+    return None
+
+
+def _validate_sql(sql_query: str) -> str | None:
+    statement = sql_query.strip()
+    if not statement.upper().startswith("SELECT"):
+        return "error: SECURITY BLOCK: Only SELECT operations are authorized on this view."
+    if ";" in statement:
+        return "error: SECURITY BLOCK: Only one SELECT statement is authorized."
+    if _SQL_FORBIDDEN.search(statement):
+        return "error: SECURITY BLOCK: Only read-only SELECT operations are authorized."
+    return None
+
 # ==========================================
 # 2. CORE FDE AGENT TOOLS
 # ==========================================
@@ -104,6 +233,16 @@ def query_telemetry_db(sql_query: str) -> str:
     Risk_Classification, Delay_Probability, Port_Congestion_Level, Route_Risk_Index.
     Always write standard T-SQL queries.
     """
+    blocked = _over_turn_cap("query_telemetry_db")
+    if blocked:
+        return blocked
+    invalid = _validate_sql(sql_query)
+    if invalid:
+        return invalid
+    closed = sql_breaker.allow()
+    if closed:
+        return closed
+
     connection_string = (
             f"DRIVER={{ODBC Driver 18 for SQL Server}};"
             f"SERVER={db_host},{db_port};"
@@ -112,31 +251,38 @@ def query_telemetry_db(sql_query: str) -> str:
             f"PWD={db_password};"
             f"Encrypt=no;"
             f"TrustServerCertificate=yes;"
+            f"Connection Timeout={SQL_TIMEOUT_SECONDS};"
         )
 
     params = urllib.parse.quote_plus(connection_string)
-    
     engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
-    
+
     try:
-        if not sql_query.strip().upper().startswith("SELECT"):
-            return "SECURITY BLOCK: Only SELECT operations are authorized on this view."
-            
         with engine.connect() as conn:
+            driver_conn = getattr(conn.connection, "driver_connection", None)
+            if driver_conn is not None:
+                driver_conn.timeout = SQL_TIMEOUT_SECONDS
             cursor = conn.execute(text(sql_query))
             columns = list(cursor.keys())
             rows = cursor.fetchmany(10)
-            
+
             if not rows:
+                sql_breaker.record_success()
                 return "No records matched the query criteria."
-                
+
             formatted_output = f"COLUMNS: {', '.join(columns)}\n"
             for row in rows:
                 formatted_output += str(tuple(row)) + "\n"
-                
+
+            sql_breaker.record_success()
             return formatted_output
     except Exception as e:
-        return f"Database Error: {str(e)}"
+        message = str(e)
+        if _is_outage(message):
+            sql_breaker.record_failure()
+        return f"error: Database Error: {message}"
+    finally:
+        engine.dispose()
 
 @tool
 def fetch_corridor_conditions(latitude: float, longitude: float) -> str:
@@ -144,27 +290,60 @@ def fetch_corridor_conditions(latitude: float, longitude: float) -> str:
     Fetches real-time weather and corridor conditions from a live REST API for given GPS coordinates.
     Provides temperature, wind speed, and computed corridor congestion index.
     """
-    try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current_weather=true"
-        response = requests.get(url, timeout=6)
-        response.raise_for_status()
-        
-        payload = response.json().get("current_weather", {})
-        temp = payload.get("temperature", "N/A")
-        wind = payload.get("windspeed", 0.0)
-        
-        congestion_index = 8.5 if wind > 10.0 else 2.5
-        status_note = "High Transit Disruption" if wind > 10.0 else "Corridor Normal"
-        
+    blocked = _over_turn_cap("fetch_corridor_conditions")
+    if blocked:
+        return blocked
+    if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
         return (
-            f"--- LIVE CORRIDOR TELEMETRY ---\n"
-            f"Target GPS: {latitude}, {longitude}\n"
-            f"External Temp: {temp}°C | Wind Speed: {wind} km/h\n"
-            f"Corridor Risk: {status_note} (Congestion Index: {congestion_index}/10)\n"
-            f"-------------------------------"
+            "error: Invalid coordinates. Latitude must be between -90 and 90 "
+            "and longitude between -180 and 180."
         )
-    except Exception as e:
-        return f"Corridor API Communication Failure: {str(e)}"
+    closed = weather_breaker.allow()
+    if closed:
+        return closed
+
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={latitude}&longitude={longitude}&current_weather=true"
+    )
+    last_error = "unknown weather failure"
+    for attempt in (1, 2):
+        try:
+            response = requests.get(url, timeout=WEATHER_TIMEOUT_SECONDS)
+            if response.status_code >= 500:
+                raise requests.HTTPError(f"HTTP {response.status_code}", response=response)
+            response.raise_for_status()
+            payload = response.json().get("current_weather", {})
+            temp = payload.get("temperature", "N/A")
+            wind = payload.get("windspeed", 0.0)
+            congestion_index = 8.5 if wind > 10.0 else 2.5
+            status_note = "High Transit Disruption" if wind > 10.0 else "Corridor Normal"
+            weather_breaker.record_success()
+            return (
+                f"--- LIVE CORRIDOR TELEMETRY ---\n"
+                f"Target GPS: {latitude}, {longitude}\n"
+                f"External Temp: {temp}°C | Wind Speed: {wind} km/h\n"
+                f"Corridor Risk: {status_note} (Congestion Index: {congestion_index}/10)\n"
+                f"-------------------------------"
+            )
+        except requests.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else 0
+            last_error = str(e)
+            if status_code >= 500 and attempt == 1:
+                time.sleep(_WEATHER_RETRY_SECONDS)
+                continue
+            if status_code >= 500:
+                weather_breaker.record_failure()
+            return f"error: Corridor API Communication Failure: {last_error}"
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_error = str(e)
+            if attempt == 1:
+                time.sleep(_WEATHER_RETRY_SECONDS)
+                continue
+            weather_breaker.record_failure()
+        except Exception as e:
+            return f"error: Corridor API Communication Failure: {e}"
+    return f"error: Corridor API Communication Failure: {last_error}"
 
 @tool
 def search_compliance_sop(query: str) -> str:
@@ -172,17 +351,39 @@ def search_compliance_sop(query: str) -> str:
     Searches enterprise Standard Operating Procedures (SOPs) indexed in the Pinecone Vector DB.
     Use this to retrieve regulatory thresholds, cold-chain breach mitigations, and rerouting rules.
     """
+    blocked = _over_turn_cap("search_compliance_sop")
+    if blocked:
+        return blocked
+    cleaned = query.strip()
+    if not cleaned:
+        return "error: The rule-book search needs a question."
+    if len(cleaned) > 500:
+        return "error: The rule-book search is too long. Ask about one rule."
+    closed = sop_breaker.allow()
+    if closed:
+        return closed
+
+    future = _sop_pool.submit(retriever.invoke, cleaned)
     try:
-        matched_docs = retriever.invoke(query)
-        if not matched_docs:
-            return "No matching compliance clauses found."
-            
-        formatted_context = "\n\n".join(
-            [f"[Source: {doc.metadata.get('source_file', 'SOP')} | Format: {doc.metadata.get('file_format', 'RAW')}]\n{doc.page_content}" for doc in matched_docs]
-        )
-        return f"--- COMPLIANCE SOP CONTEXT ---\n{formatted_context}\n------------------------------"
+        matched_docs = future.result(timeout=SOP_TIMEOUT_SECONDS)
+    except FuturesTimeout:
+        sop_breaker.record_failure()
+        return "error: Vector Store Retrieval Error: the rule book did not answer within 8 seconds."
     except Exception as e:
-        return f"Vector Store Retrieval Error: {str(e)}"
+        message = str(e)
+        if _is_outage(message):
+            sop_breaker.record_failure()
+        return f"error: Vector Store Retrieval Error: {message}"
+
+    if not matched_docs:
+        sop_breaker.record_success()
+        return "No matching compliance clauses found."
+
+    formatted_context = "\n\n".join(
+        [f"[Source: {doc.metadata.get('source_file', 'SOP')} | Format: {doc.metadata.get('file_format', 'RAW')}]\n{doc.page_content}" for doc in matched_docs]
+    )
+    sop_breaker.record_success()
+    return f"--- COMPLIANCE SOP CONTEXT ---\n{formatted_context}\n------------------------------"
 
 # ==========================================
 # 3. LOCAL VERIFICATION
