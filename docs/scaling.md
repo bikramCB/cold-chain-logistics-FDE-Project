@@ -121,6 +121,34 @@ Do these only after the company asks. Keep the current VM serving traffic until 
 9. Keep Streamlit for internal dispatchers and point its `.env` at Cloud SQL and Redis. For the 1,000-user site, add a small page that posts the question and the `thread_id` to the load balancer. The page does not store the conversation.
 10. Load-test the load-balancer URL with 1,000 in-flight chats. Check that a second message with the same `thread_id` keeps context on a different Cloud Run instance, that `AgentAuditLog` gains rows, and that Vertex returns no quota errors. Change DNS only after that. Retire the Docker SQL VM and the public role of the Streamlit VM last.
 
+## Current design tradeoffs
+
+These describe the console that is running now. The table above is the later 1,000-user design.
+
+### Guardrails on the request path
+
+`screen_input` and `check_answer` in `src/guardrails.py` are regular expressions, substring checks, and number comparisons. They stay on the request path and add about a millisecond. A flagged draft calls Gemini one more time before the dispatcher sees an answer, and that rewrite takes seconds. Replacing these checks with a second model, such as Llama-Guard or another Gemini call on every turn, would add that model wait to the turns that are already fine.
+
+### SOP cache in process memory
+
+`src/sop_cache.py` is a thread-safe dictionary in the Streamlit process. The key is the session and the question. It stores policy answers only, for `SOP_CACHE_IDLE_SECONDS` of idle time and at most `SOP_CACHE_MAX_AGE_SECONDS`. It does not store fleet or weather answers. A second VM cannot see the dictionary, so a load balancer causes cache misses. Gemini temperature is `1.0`, so the new answer can also be worded differently. Sharing one SOP answer across sessions would show one dispatcher's saved reply to another person.
+
+### Scores at night, traces immediately
+
+`evals/run_judge_job.py` runs as the Cloud Run job `eval-judge` at 02:00 Asia/Kolkata. The live chat does not wait for a score, and it does not spend judge tokens during the turn. The score is missing until that job finishes. The question, tool text, token counts, and durations are already in `FDE_VIEWS.AgentAuditLog` when the turn ends. The job reads that table at `10.128.0.2` through the default VPC. If that connection fails, BigQuery `eval.judge_scores` gets no new rows. The table is used as an append log. SQL does not enforce that a row can never be updated.
+
+### The judge is a job, and SQL stays private
+
+The judge container starts at night and exits, so it has no idle compute cost. It does not add copies as chat traffic grows. A Cloud Run service would do that. This job uses Direct VPC egress on the `default` network to reach the private SQL address. Port 1433 is not open to the public internet for that path, and a static outbound IP is not required.
+
+### Pinecone for rules, SQL for the live fleet
+
+The rule book is Pinecone. Live fleet state is `FDE_VIEWS.VW_ACTIVE_FLEET`. The model chooses the tool. A bad choice can answer a live shipment from static SOP text. The database grant is the boundary that still holds: `USR_FDE_RO` can read the view and cannot read `dbo.TBL_SC_FLEET_HIST_RAW`. `query_telemetry_db` also refuses anything that is not a single `SELECT`.
+
+### What the audit row costs
+
+Each turn stores the question, tool text, token counts, and `duration_ms`. `Content` is `NVARCHAR(MAX)`, so the SQL row is the storage that grows. The judge then spends tokens rereading those rows. The BigQuery insert fee is the small part. `cost_usd` is computed from `GEMINI_INPUT_USD_PER_MILLION` and `GEMINI_OUTPUT_USD_PER_MILLION`. A model change or a price change means updating those variables on the Cloud Run job. Rows already in `eval.judge_scores` keep the price from the run that wrote them.
+
 ## What must keep working
 
 - `.env` stays on the VM and out of git. Cloud Run reads secrets from Secret Manager.

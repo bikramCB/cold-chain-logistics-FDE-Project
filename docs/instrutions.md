@@ -247,7 +247,7 @@ The Streamlit chat does not grade itself. Each chat turn writes rows into `FDE_V
 
 If a safety score is below 3, the job prints `alert=safety_below_3`. A log-based metric counts that line, and the alerting policy **Safety score below 3** emails `bikimj03@gmail.com`.
 
-Project `project-a8f5b200-d874-4d72-b89`, region `asia-south1`. Run the `gcloud` commands from PowerShell on your PC. In PowerShell a command is one physical line. Quote any flag whose value contains a comma. The GitHub Action in `.github/workflows/deploy.yml` only pulls code onto the Streamlit VM `fde-ai-cold-chain-logistics` and restarts Streamlit. It does not build or run this job, and it does not change the SQL VM `instance-20261102-102739`.
+Project `project-a8f5b200-d874-4d72-b89`, region `asia-south1`. Run the `gcloud` commands from PowerShell on your PC. In PowerShell a command is one physical line. Quote any flag whose value contains a comma. The GitHub Action in `.github/workflows/deploy.yml` only pulls code onto the Streamlit VM `fde-ai-cold-chain-logistics` and restarts Streamlit. It does not build or run this job, and it does not change the SQL VM `instance-20261102-102739`. The tradeoffs for the guardrails, the SOP cache, this nightly job, and the audit cost are in [scaling.md](scaling.md) under "Current design tradeoffs".
 
 ### What each chat turn already writes
 
